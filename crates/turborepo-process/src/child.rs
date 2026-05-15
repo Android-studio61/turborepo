@@ -17,8 +17,8 @@
 
 const CHILD_POLL_INTERVAL: Duration = Duration::from_micros(50);
 const POST_EXIT_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
-#[cfg(unix)]
-const PROCESS_GROUP_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(any(unix, windows))]
+const PROCESS_TREE_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 use std::{
     fmt,
@@ -188,6 +188,9 @@ fn capture_target_identity(pid: Option<u32>) -> Option<TargetIdentity> {
 impl ChildHandle {
     #[tracing::instrument(skip(command))]
     pub fn spawn_normal(command: Command) -> io::Result<SpawnResult> {
+        #[cfg(windows)]
+        let command_for_fallback = command.clone();
+
         let mut command = TokioCommand::from(command);
 
         // Create a new process group so we can send signals (e.g. SIGINT) to
@@ -195,18 +198,59 @@ impl ChildHandle {
         #[cfg(unix)]
         command.process_group(0);
 
+        #[cfg(windows)]
+        let job = match super::job_object::JobObject::new() {
+            Ok(job) => Some(job),
+            Err(err) => {
+                debug!("failed to create Windows JobObject: {err}");
+                None
+            }
+        };
+
+        #[cfg(windows)]
+        if job.is_some() {
+            command.creation_flags(
+                windows_sys::Win32::System::Threading::CREATE_SUSPENDED
+                    | windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB,
+            );
+        }
+
+        #[cfg(not(windows))]
         let mut child = command.spawn()?;
+
+        #[cfg(windows)]
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(err) if job.is_some() => {
+                debug!("failed to spawn child with job breakaway: {err}");
+                let mut fallback_command = TokioCommand::from(command_for_fallback);
+                fallback_command
+                    .creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+                fallback_command.spawn()?
+            }
+            Err(err) => return Err(err),
+        };
         let pid = child.id();
 
         #[cfg(unix)]
         let target_identity = capture_target_identity(pid);
 
         #[cfg(windows)]
-        let job = pid.and_then(|pid| {
-            super::job_object::JobObject::new()
-                .and_then(|job| job.assign_pid(pid).map(|_| job))
-                .map_err(|e| debug!("failed to set up job object for process {pid}: {e}"))
-                .ok()
+        let job = job.and_then(|job| match child.raw_handle() {
+            Some(handle) => match job.assign_suspended_process(handle) {
+                Ok(true) => Some(job),
+                Ok(false) => None,
+                Err(err) => {
+                    debug!("failed to resume suspended process after job assignment: {err}");
+                    child.start_kill().ok();
+                    None
+                }
+            },
+            None => {
+                debug!("failed to get child process handle for job assignment");
+                child.start_kill().ok();
+                None
+            }
         });
 
         let stdin = child.stdin.take().map(ChildInput::Std);
@@ -434,7 +478,7 @@ impl ChildHandle {
                             self.kill_process_group(pid);
                             return ChildExit::Killed;
                         }
-                        _ = tokio::time::sleep(PROCESS_GROUP_DRAIN_POLL_INTERVAL) => {}
+                        _ = tokio::time::sleep(PROCESS_TREE_DRAIN_POLL_INTERVAL) => {}
                     }
                 }
                 None => {
@@ -450,9 +494,77 @@ impl ChildHandle {
                                 None => *command_rx_open = false,
                             }
                         }
-                        _ = tokio::time::sleep(PROCESS_GROUP_DRAIN_POLL_INTERVAL) => {}
+                        _ = tokio::time::sleep(PROCESS_TREE_DRAIN_POLL_INTERVAL) => {}
                     }
                 }
+            }
+        }
+
+        ChildExit::Interrupted
+    }
+
+    #[cfg(windows)]
+    fn has_running_windows_process_tree(&self) -> bool {
+        let has_active_job = self
+            ._job
+            .as_ref()
+            .is_some_and(|job| match job.active_processes() {
+                Ok(active_processes) => active_processes > 0,
+                Err(err) => {
+                    debug!("failed to query job object: {err}");
+                    false
+                }
+            });
+
+        let has_descendants = match self.pid {
+            Some(pid) => match super::job_object::has_descendant_processes(pid) {
+                Ok(has_descendants) => has_descendants,
+                Err(err) => {
+                    debug!("failed to query descendant processes: {err}");
+                    false
+                }
+            },
+            None => false,
+        };
+
+        has_active_job || has_descendants
+    }
+
+    #[cfg(windows)]
+    fn terminate_windows_process_tree(&self) {
+        if let Some(job) = &self._job
+            && let Err(err) = job.terminate()
+        {
+            debug!("failed to terminate job object: {err}");
+        }
+
+        if let Some(pid) = self.pid
+            && let Err(err) = super::job_object::terminate_descendant_processes(pid)
+        {
+            debug!("failed to terminate descendant process tree: {err}");
+        }
+    }
+
+    #[cfg(windows)]
+    async fn wait_for_job_exit(
+        &mut self,
+        command_rx: &mut mpsc::Receiver<ChildCommand>,
+        command_rx_open: &mut bool,
+    ) -> ChildExit {
+        while self.has_running_windows_process_tree() {
+            tokio::select! {
+                command = command_rx.recv(), if *command_rx_open => {
+                    match command {
+                        Some(ChildCommand::Kill) => {
+                            debug!("process tree drain interrupted, terminating job object");
+                            self.terminate_windows_process_tree();
+                            return ChildExit::Killed;
+                        }
+                        Some(ChildCommand::Shutdown(_)) => {}
+                        None => *command_rx_open = false,
+                    }
+                }
+                _ = tokio::time::sleep(PROCESS_TREE_DRAIN_POLL_INTERVAL) => {}
             }
         }
 
@@ -781,7 +893,45 @@ impl Child {
                 }
                 status = child.wait() => {
                     drop(controller);
-                    manager.handle_child_exit(status).await;
+                    let should_drain_process_tree = matches!(&status, Ok(Some(0)));
+
+                    #[cfg(unix)]
+                    let killed_during_drain = if should_drain_process_tree
+                        && let Some(pid) = pid
+                    {
+                        let mut command_rx_open = true;
+                        child
+                            .wait_for_process_group_exit(
+                                pid as libc::pid_t,
+                                None,
+                                &mut command_rx,
+                                &mut command_rx_open,
+                            )
+                            .await
+                            == ChildExit::Killed
+                    } else {
+                        false
+                    };
+
+                    #[cfg(windows)]
+                    let killed_during_drain = if should_drain_process_tree {
+                        let mut command_rx_open = true;
+                        child
+                            .wait_for_job_exit(&mut command_rx, &mut command_rx_open)
+                            .await
+                            == ChildExit::Killed
+                    } else {
+                        false
+                    };
+
+                    #[cfg(not(any(unix, windows)))]
+                    let killed_during_drain = false;
+
+                    if killed_during_drain {
+                        manager.exit_tx.send(Some(ChildExit::Killed)).ok();
+                    } else {
+                        manager.handle_child_exit(status).await;
+                    }
                 }
             }
 
